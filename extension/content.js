@@ -5,7 +5,8 @@
    ===================================================================== */
 
 const SERVER = "http://127.0.0.1:5001";
-const BTN_ID = "ytdl-download-btn";
+const WATCH_BTN_ID = "ytdl-watch-download-btn";
+const SHORTS_BTN_ID = "ytdl-shorts-download-btn";
 
 /* ---------- утилиты ---------- */
 
@@ -86,9 +87,16 @@ function closeMenu() {
   document.removeEventListener("click", onDocClick, true);
 }
 
+function currentAnchorButton() {
+  return (
+    document.getElementById(WATCH_BTN_ID) ||
+    document.getElementById(SHORTS_BTN_ID)
+  );
+}
+
 function onDocClick(e) {
   const menu = document.getElementById("ytdl-menu");
-  const btn = document.getElementById(BTN_ID);
+  const btn = currentAnchorButton();
   if (menu && !menu.contains(e.target) && btn && !btn.contains(e.target)) {
     closeMenu();
   }
@@ -232,10 +240,14 @@ function downloadIcon() {
 /* ---------- кнопки ---------- */
 
 // Обычная кнопка-чип (для /watch) — слева от лайка, с текстом
-function buildButton() {
-  const btn = el("button", { id: BTN_ID, className: "ytdl-btn", title: "Скачать видео" });
+function buildWatchButton() {
+  const btn = el("button", {
+    id: WATCH_BTN_ID,
+    className: "ytdl-watch-btn",
+    title: "Скачать видео",
+  });
   btn.append(downloadIcon());
-  btn.append(el("span", { className: "ytdl-btn-text", textContent: "Скачать" }));
+  btn.append(el("span", { className: "ytdl-watch-btn-text", textContent: "Скачать" }));
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     openMenu(btn);
@@ -243,9 +255,13 @@ function buildButton() {
   return btn;
 }
 
-// Круглая вертикальная кнопка (для Shorts) — над лайком, без текста
+// Полностью отдельная кнопка для Shorts
 function buildShortsButton() {
-  const wrap = el("div", { id: BTN_ID, className: "ytdl-shorts-btn", title: "Скачать видео" });
+  const wrap = el("div", {
+    id: SHORTS_BTN_ID,
+    className: "ytdl-shorts-btn",
+    title: "Скачать видео",
+  });
   const circle = el("button", { className: "ytdl-shorts-circle" });
   circle.append(downloadIcon());
   wrap.append(circle);
@@ -274,7 +290,7 @@ function insertWatchButton() {
     actions.querySelector("ytd-segmented-like-dislike-button-renderer") ||
     actions.firstElementChild;
 
-  const btn = buildButton();
+  const btn = buildWatchButton();
   if (likeSegment) actions.insertBefore(btn, likeSegment);
   else actions.prepend(btn);
   return true;
@@ -285,95 +301,130 @@ function insertWatchButton() {
 function isElementVisible(elm) {
   if (!elm) return false;
   const r = elm.getBoundingClientRect();
-  return (
-    r.width > 0 &&
-    r.height > 0 &&
-    r.bottom > 0 &&
-    r.top < window.innerHeight
-  );
+  return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight;
 }
 
-// Находит кнопку "лайк" в текущем видимом Shorts (по aria/id/href — живуче)
+// Находит видимую кнопку "лайк" в текущем Shorts
 function findShortsLikeButton() {
-  // 1) пробуем по разным селекторам, которые встречались в вёрстке Shorts
-  const candidates = [
+  const sels = [
     "#like-button",
     "ytd-toggle-button-renderer",
     "ytd-like-button-renderer",
     "like-button-view-model",
     "button[aria-label*='Нравится']",
     "button[aria-label*='like' i]",
-    "[id='like-button']",
   ];
-  const likes = [];
-  for (const sel of candidates) {
-    document.querySelectorAll(sel).forEach((n) => likes.push(n));
+  const found = [];
+  for (const s of sels) document.querySelectorAll(s).forEach((n) => found.push(n));
+  const vis = found.filter(isElementVisible);
+  if (!vis.length) return null;
+  vis.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  return vis[0];
+}
+
+// Поднимается от кнопки лайка до её "ячейки" — прямого ребёнка панели действий.
+// Так наша кнопка встанет ровно в тот же ряд, что и нативные.
+function findShortsActionCell(likeBtn) {
+  let node = likeBtn;
+  let parent = node.parentElement;
+  // ищем родителя-контейнер, где лежат несколько вертикальных ячеек действий
+  for (let i = 0; i < 8 && parent; i++) {
+    const siblings = parent.children;
+    // панель действий: несколько детей, расположенных вертикально (столбиком)
+    if (siblings.length >= 2) {
+      const a = node.getBoundingClientRect();
+      let verticalSiblings = 0;
+      for (const sib of siblings) {
+        if (sib === node) continue;
+        const b = sib.getBoundingClientRect();
+        // другой элемент примерно по той же вертикали (столбик действий)
+        if (b.width && Math.abs((b.left + b.width / 2) - (a.left + a.width / 2)) < 40) {
+          verticalSiblings++;
+        }
+      }
+      if (verticalSiblings >= 1) {
+        return { cell: node, panel: parent };
+      }
+    }
+    node = parent;
+    parent = node.parentElement;
   }
-  // оставляем только видимые
-  const visible = likes.filter(isElementVisible);
-  if (!visible.length) return null;
-  // берём самый верхний (в Shorts лайк — первая кнопка в боковой панели)
-  visible.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-  return visible[0];
+  return { cell: likeBtn, panel: likeBtn.parentElement };
 }
 
 function insertShortsButton() {
   const likeBtn = findShortsLikeButton();
   if (!likeBtn) return false;
 
-  // Контейнер кнопки лайка — поднимаемся до "ячейки" действия (родитель,
-  // который стоит в вертикальном ряду). Вставляем нашу кнопку ПЕРЕД ней.
-  // Ищем родителя, который является прямым ребёнком панели действий.
-  let likeCell = likeBtn;
-  // поднимаемся максимум на несколько уровней, пока родитель не станет
-  // контейнером с несколькими кнопками (панель действий)
-  for (let i = 0; i < 6 && likeCell.parentElement; i++) {
-    const p = likeCell.parentElement;
-    // панель действий обычно содержит несколько кнопок-ячеек
-    if (p.childElementCount >= 2 && p.querySelectorAll("button").length >= 2) {
-      const btn = buildShortsButton();
-      p.insertBefore(btn, likeCell);
-      return true;
-    }
-    likeCell = p;
-  }
-  // запасной вариант: вставить прямо перед кнопкой лайка
+  const { cell, panel } = findShortsActionCell(likeBtn);
+  if (!panel) return false;
+
   const btn = buildShortsButton();
-  likeBtn.parentElement.insertBefore(btn, likeBtn);
+  panel.insertBefore(btn, cell); // НАД лайком
   return true;
 }
 
 function insertButton() {
   if (isShorts()) {
-    // На Shorts активный ролик меняется при прокрутке — кнопка должна быть
-    // в видимой панели. Если она "осела" в скрытом ролике — переставим.
-    const existing = document.getElementById(BTN_ID);
+    // На Shorts оставляем ТОЛЬКО отдельную shorts-кнопку.
+
+    // Активный ролик меняется при прокрутке — наша кнопка должна стоять рядом
+    // с ВИДИМЫМ лайком. Сверяем: если наша кнопка далеко от текущего лайка —
+    // переносим её.
+    const like = findShortsLikeButton();
+    if (!like) return;
+    document.getElementById(WATCH_BTN_ID)?.remove();
+
+    const existing = document.getElementById(SHORTS_BTN_ID);
     if (existing) {
-      const r = existing.getBoundingClientRect();
-      const visible =
-        r.bottom > 0 && r.top < window.innerHeight && r.width > 0 && r.height > 0;
-      if (visible) return; // уже в нужном месте
-      existing.remove(); // была в скрытом ролике — убираем и ставим заново
+      const er = existing.getBoundingClientRect();
+      const lr = like.getBoundingClientRect();
+      const sameColumn =
+        er.width > 0 &&
+        Math.abs((er.left + er.width / 2) - (lr.left + lr.width / 2)) < 60 &&
+        er.bottom > 0 &&
+        er.top < window.innerHeight;
+      const isAboveLike = er.bottom <= lr.top + 8;
+      if (sameColumn && isAboveLike) return; // уже на месте у активного ролика
+      existing.remove(); // не на месте — переставим выше
     }
     insertShortsButton();
   } else if (location.pathname.startsWith("/watch")) {
-    if (document.getElementById(BTN_ID)) return;
+    document.getElementById(SHORTS_BTN_ID)?.remove();
+    if (document.getElementById(WATCH_BTN_ID)) return;
     insertWatchButton();
   } else {
-    // ушли со страницы видео/Shorts — подчистим кнопку
-    document.getElementById(BTN_ID)?.remove();
+    document.getElementById(WATCH_BTN_ID)?.remove();
+    document.getElementById(SHORTS_BTN_ID)?.remove();
   }
 }
 
-/* ---------- наблюдатель: YouTube — SPA, контент меняется без перезагрузки ---------- */
+/* ---------- наблюдатель: YouTube — SPA, контент меняется без перезагрузки ----------
+   Throttle через requestAnimationFrame: на Shorts DOM меняется очень часто,
+   без троттлинга insertButton() дёргался бы сотни раз в секунду — отсюда лаги
+   и "прыжки" кнопки. Теперь — максимум один вызов за кадр. */
 
-const observer = new MutationObserver(() => insertButton());
+let scheduled = false;
+function scheduleInsert() {
+  if (scheduled) return;
+  scheduled = true;
+  requestAnimationFrame(() => {
+    scheduled = false;
+    try {
+      insertButton();
+    } catch (e) {
+      /* ignore */
+    }
+  });
+}
+
+const observer = new MutationObserver(scheduleInsert);
 observer.observe(document.documentElement, { childList: true, subtree: true });
 
-// На навигацию внутри YouTube
+// Навигация внутри YouTube (в т.ч. перелистывание Shorts)
 document.addEventListener("yt-navigate-finish", () => {
   closeMenu();
-  setTimeout(insertButton, 300);
+  setTimeout(scheduleInsert, 300);
 });
 
-insertButton();
+scheduleInsert();
