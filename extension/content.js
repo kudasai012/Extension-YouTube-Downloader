@@ -366,11 +366,11 @@ function insertShortsButton() {
 
 function insertButton() {
   if (isShorts()) {
-    // На Shorts оставляем ТОЛЬКО отдельную shorts-кнопку.
+    // Если открыты комментарии/лист шеринга/другой оверлей справа,
+    // не даём кнопке перескакивать в панель комментариев.
+    const commentsOpen = document.querySelector('ytd-shorts[is-comments-panel-open], ytd-engagement-panel-section-list-renderer, tp-yt-paper-dialog ytd-comments');
+    if (commentsOpen) return;
 
-    // Активный ролик меняется при прокрутке — наша кнопка должна стоять рядом
-    // с ВИДИМЫМ лайком. Сверяем: если наша кнопка далеко от текущего лайка —
-    // переносим её.
     const like = findShortsLikeButton();
     if (!like) return;
     document.getElementById(WATCH_BTN_ID)?.remove();
@@ -385,8 +385,9 @@ function insertButton() {
         er.bottom > 0 &&
         er.top < window.innerHeight;
       const isAboveLike = er.bottom <= lr.top + 8;
-      if (sameColumn && isAboveLike) return; // уже на месте у активного ролика
-      existing.remove(); // не на месте — переставим выше
+      const enoughRight = er.left > window.innerWidth * 0.72; // не уезжать в колонку комментариев
+      if (sameColumn && isAboveLike && enoughRight) return;
+      existing.remove();
     }
     insertShortsButton();
   } else if (location.pathname.startsWith("/watch")) {
