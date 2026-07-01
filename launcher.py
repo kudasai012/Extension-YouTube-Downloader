@@ -1,36 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-YT Downloader — Launcher
-=========================
-Современный GUI-лаунчер (PySide6) для локального сервера yt-dlp.
+YT Downloader — Launcher (со встроенным сервером)
+====================================================
+Всё в одном .exe: GUI-лаунчер (PySide6) и локальный сервер (Flask + yt-dlp)
+работают в одном процессе — сервер поднимается в фоновом потоке, отдельного
+server.exe не требуется вообще.
 
 Возможности:
-  • Одна кнопка Run/Stop — запускает и останавливает сервер
+  • Одна кнопка Run/Stop — запускает и останавливает встроенный сервер
   • Живой журнал сервера (сворачиваемый)
   • Индикатор состояния сервера (пинг http://127.0.0.1:5001/ping)
   • Сворачивание в системный трей вместо закрытия
   • Настройки с переключателями + кнопка «Сохранить»:
       - запускать сервер при старте программы
       - запускать программу вместе с Windows (в трее)
+      - (опционально, для экстренных случаев) использовать внешний
+        server.py / server.exe вместо встроенного — обычно не нужно,
+        всё работает само
 
 Расположение:
   yt-downloader/
-  ├── launcher.py        <-- этот файл лежит здесь, в корне проекта
-  ├── server/
-  │   └── server.py
+  ├── launcher.py        <-- этот файл, всё остальное уже внутри него
   └── extension/
 
 Установка зависимостей:
-  pip install PySide6
+  pip install PySide6 flask flask-cors yt-dlp
 
 Запуск:
   python launcher.py            — обычный запуск (окно показывается)
   python launcher.py --tray     — старт сразу в трее (используется автозапуском)
+
+Сборка в один .exe:
+  pyinstaller --noconfirm --clean --onefile --windowed ^
+    --name "YT Downloader" --icon "build/icon.ico" ^
+    --collect-all yt_dlp --collect-all flask_cors launcher.py
 """
 
+import os
+import re
 import sys
+import time
 import shutil
+import logging
+import threading
+import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -41,22 +55,385 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QActio
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QPlainTextEdit, QSystemTrayIcon, QMenu,
-    QFrame, QAbstractButton, QGraphicsDropShadowEffect, QSizePolicy,
+    QFrame, QAbstractButton, QGraphicsDropShadowEffect, QFileDialog,
 )
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 
-# ───────────────────────── Константы ─────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  ЧАСТЬ 1 — Сервер (то, что раньше было отдельным server.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from yt_dlp import YoutubeDL
+from werkzeug.serving import make_server
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5001
+
+flask_app = Flask(__name__)
+CORS(flask_app, resources={r"/*": {"origins": "*"}})
+
+DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube")
+os.makedirs(DEFAULT_DOWNLOAD_DIR, exist_ok=True)
+
+TEMP_DOWNLOAD_DIR = os.path.join(DEFAULT_DOWNLOAD_DIR, ".tmp_browser_downloads")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+
+# Прогресс активных загрузок: { job_id: {percent, speed, eta, status, filename} }
+PROGRESS = {}
+
+
+def human_size(num):
+    if num is None:
+        return "?"
+    for unit in ["Б", "КБ", "МБ", "ГБ", "ТБ"]:
+        if num < 1024:
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} ПБ"
+
+
+def sanitize(name):
+    return re.sub(r'[\\/*?:"<>|]', "", name)[:200]
+
+
+def _fmt_string(height):
+    return (f"bestvideo[height<={height}]+bestaudio/"
+            f"best[height<={height}]/best")
+
+
+def _fmt_size(f):
+    s = f.get("filesize") or f.get("filesize_approx")
+    if s:
+        return int(s)
+    dur = f.get("duration")
+    br = f.get("vbr") or f.get("abr") or f.get("tbr")
+    if br and dur:
+        return int(br * 1000 / 8 * dur)
+    return 0
+
+
+@flask_app.route("/formats", methods=["GET", "POST"])
+def formats():
+    url = request.args.get("url") or (request.json or {}).get("url")
+    if not url:
+        return jsonify({"error": "no url"}), 400
+
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    title = info.get("title", "video")
+    duration = info.get("duration") or 0
+    all_formats = info.get("formats", [])
+
+    for f in all_formats:
+        f.setdefault("duration", duration)
+
+    heights = sorted(
+        {f["height"] for f in all_formats if f.get("height") and f["height"] >= 360},
+        reverse=True,
+    )
+
+    qualities = []
+    for h in heights:
+        total = 0
+        exact = False
+        try:
+            sel_opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                        "format": _fmt_string(h)}
+            with YoutubeDL(sel_opts) as y2:
+                sel = y2.process_ie_result(dict(info), download=False)
+            chosen = sel.get("requested_formats")
+            if chosen:
+                total = sum(_fmt_size(f) for f in chosen)
+                exact = all(
+                    (f.get("filesize") or f.get("filesize_approx")) for f in chosen
+                )
+            else:
+                total = _fmt_size(sel)
+                exact = bool(sel.get("filesize") or sel.get("filesize_approx"))
+        except Exception:
+            total = 0
+
+        qualities.append({
+            "height": h,
+            "label": f"{h}p",
+            "bytes": int(total),
+            "size_human": (("" if exact else "≈ ") + human_size(total))
+            if total else "≈ ?",
+            "exact": exact,
+        })
+
+    return jsonify({
+        "title": title,
+        "duration": duration,
+        "thumbnail": info.get("thumbnail"),
+        "qualities": qualities,
+    })
+
+
+def _do_download(url, height, job_id, save_dir):
+    PROGRESS[job_id] = {"status": "downloading", "percent": 0, "speed": "",
+                        "eta": "", "filename": ""}
+
+    def hook(d):
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes", 0)
+            pct = (done / total * 100) if total else 0
+            PROGRESS[job_id].update({
+                "percent": round(pct, 1),
+                "speed": human_size(d.get("speed") or 0) + "/с",
+                "eta": d.get("eta"),
+            })
+        elif d["status"] == "finished":
+            PROGRESS[job_id].update({"percent": 100, "status": "processing"})
+
+    fmt = _fmt_string(height)
+
+    ydl_opts = {
+        "format": fmt,
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(save_dir, "%(title)s [%(height)sp].%(ext)s"),
+        "progress_hooks": [hook],
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 10,
+        "postprocessor_args": {"ffmpeg": ["-hide_banner", "-loglevel", "error"]},
+    }
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fname = ydl.prepare_filename(info)
+            if not fname.lower().endswith(".mp4"):
+                fname = os.path.splitext(fname)[0] + ".mp4"
+        PROGRESS[job_id].update({
+            "status": "done",
+            "percent": 100,
+            "filename": os.path.basename(fname),
+            "path": fname,
+        })
+    except Exception as e:
+        PROGRESS[job_id].update({"status": "error", "error": str(e)})
+
+
+@flask_app.route("/download", methods=["POST"])
+def download():
+    data = request.json or {}
+    url = data.get("url")
+    height = int(data.get("height", 1080))
+    save_dir = data.get("save_dir") or TEMP_DOWNLOAD_DIR
+    os.makedirs(save_dir, exist_ok=True)
+
+    if not url:
+        return jsonify({"error": "no url"}), 400
+
+    job_id = str(len(PROGRESS) + 1) + "_" + str(int.from_bytes(os.urandom(2), "big"))
+    t = threading.Thread(target=_do_download, args=(url, height, job_id, save_dir),
+                         daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
+
+@flask_app.route("/progress")
+def progress():
+    job_id = request.args.get("job_id")
+    return jsonify(PROGRESS.get(job_id, {"status": "unknown"}))
+
+
+@flask_app.route("/file")
+def get_file():
+    job_id = request.args.get("job_id")
+
+    deadline = time.time() + 30 * 60
+    while time.time() < deadline:
+        info = PROGRESS.get(job_id)
+        if not info:
+            return jsonify({"error": "unknown job"}), 404
+        if info.get("status") == "error":
+            return jsonify({"error": info.get("error", "download error")}), 500
+        if info.get("status") == "done" and info.get("path"):
+            break
+        time.sleep(0.4)
+    else:
+        return jsonify({"error": "timeout"}), 504
+
+    path = PROGRESS[job_id]["path"]
+    if not os.path.exists(path):
+        return jsonify({"error": "file missing"}), 404
+    return send_file(path, as_attachment=True,
+                     download_name=os.path.basename(path),
+                     mimetype="video/mp4")
+
+
+@flask_app.route("/cleanup", methods=["POST", "GET"])
+def cleanup():
+    """Удаляет временный файл задания после того, как расширение подтвердило,
+    что браузер полностью сохранил его в свои "Загрузки" (Ctrl+J)."""
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("job_id") or request.args.get("job_id")
+    if not job_id:
+        return jsonify({"error": "no job_id"}), 400
+
+    info = PROGRESS.get(job_id)
+    if not info:
+        return jsonify({"ok": True, "skipped": "unknown job"})
+
+    path = info.get("path")
+    if not path:
+        return jsonify({"ok": True, "skipped": "no path"})
+
+    real_path = os.path.realpath(path)
+    real_tmp_dir = os.path.realpath(TEMP_DOWNLOAD_DIR)
+    if not real_path.startswith(real_tmp_dir + os.sep):
+        return jsonify({"ok": True, "skipped": "not a temp file"})
+
+    try:
+        if os.path.exists(real_path):
+            os.remove(real_path)
+        info["path"] = None
+        info["status"] = "cleaned"
+        return jsonify({"ok": True, "deleted": real_path})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _bring_explorer_to_front(target):
+    target = os.path.normpath(target)
+    subprocess.Popen(f'explorer /select,"{target}"')
+
+
+_LAST_OPEN = {}
+_OPEN_COOLDOWN = 0.6
+
+
+@flask_app.route("/open_folder", methods=["POST"])
+def open_folder():
+    data = request.json or {}
+    job_id = data.get("job_id")
+    info = PROGRESS.get(job_id) if job_id else None
+    target = (info or {}).get("path")
+
+    if not target or not os.path.exists(target):
+        target = None
+        done = [v.get("path") for v in PROGRESS.values()
+                if v.get("status") == "done" and v.get("path") and os.path.exists(v["path"])]
+        if done:
+            target = max(done, key=lambda p: os.path.getmtime(p))
+
+    folder = os.path.dirname(target) if target else TEMP_DOWNLOAD_DIR
+    if not os.path.isdir(folder):
+        folder = TEMP_DOWNLOAD_DIR
+
+    key = os.path.normpath(folder)
+    now = time.time()
+    if now - _LAST_OPEN.get(key, 0) < _OPEN_COOLDOWN:
+        return jsonify({"ok": True, "folder": folder, "target": target, "skipped": True})
+    _LAST_OPEN[key] = now
+
+    try:
+        if os.name == "nt":
+            if target and os.path.exists(target):
+                _bring_explorer_to_front(target)
+            else:
+                os.startfile(os.path.normpath(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            if target and os.path.exists(target):
+                subprocess.Popen(["open", "-R", target])
+            else:
+                subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+        return jsonify({"ok": True, "folder": folder, "target": target})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@flask_app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "temp_dir": TEMP_DOWNLOAD_DIR})
+
+
+class QtLogHandler(logging.Handler):
+    """Перенаправляет строки логов Flask/werkzeug (например, лог запросов
+    "127.0.0.1 - - [...] GET /ping HTTP/1.1 200 -") в журнал GUI."""
+
+    def __init__(self, emit_func):
+        super().__init__()
+        self._emit_func = emit_func
+
+    def emit(self, record):
+        try:
+            self._emit_func(self.format(record))
+        except Exception:
+            pass
+
+
+class EmbeddedServer:
+    """Поднимает Flask-сервер прямо в этом процессе, в отдельном потоке,
+    вместо отдельного server.exe. Останавливается через werkzeug shutdown()
+    — без принудительного kill(), поэтому никаких "Crashed" ошибок."""
+
+    def __init__(self, host: str = SERVER_HOST, port: int = SERVER_PORT):
+        self.host = host
+        self.port = port
+        self._httpd = None
+        self._thread = None
+        self._log_handler = None
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self, log_func):
+        if self.is_running():
+            return
+
+        self._log_handler = QtLogHandler(log_func)
+        self._log_handler.setFormatter(logging.Formatter("%(message)s"))
+        werkzeug_logger = logging.getLogger("werkzeug")
+        werkzeug_logger.setLevel(logging.INFO)
+        werkzeug_logger.addHandler(self._log_handler)
+        werkzeug_logger.propagate = False
+
+        self._httpd = make_server(self.host, self.port, flask_app, threaded=True)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._httpd:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=5)
+        if self._httpd:
+            try:
+                self._httpd.server_close()
+            except Exception:
+                pass
+        if self._log_handler:
+            logging.getLogger("werkzeug").removeHandler(self._log_handler)
+        self._httpd = None
+        self._thread = None
+        self._log_handler = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ЧАСТЬ 2 — GUI лаунчер
+# ═══════════════════════════════════════════════════════════════════════
 
 APP_NAME = "YT Downloader"
 AUTOSTART_REG_NAME = "YTDownloaderLauncher"
-SERVER_PING_URL = "http://127.0.0.1:5001/ping"
+SERVER_PING_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/ping"
 
-BASE_DIR = Path(__file__).resolve().parent
-SERVER_DIR = BASE_DIR / "server"
-SERVER_SCRIPT = SERVER_DIR / "server.py"
-
-# Плоская современная палитра в духе обновлённого YouTube (тёмная тема)
 ACCENT = "#ff0033"
 ACCENT_HOVER = "#e6002e"
 BG = "#0f0f0f"
@@ -76,7 +453,6 @@ def _is_windows() -> bool:
 
 
 def _autostart_command() -> str:
-    """Команда, которая будет прописана в реестре автозапуска."""
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --tray'
     exe = Path(sys.executable)
@@ -123,7 +499,6 @@ def set_autostart(enabled: bool) -> None:
 # ───────────────────────── Иконка приложения ─────────────────────────
 
 def make_app_icon() -> QIcon:
-    """Круглая красная иконка со стрелкой загрузки — без внешних файлов."""
     size = 128
     pix = QPixmap(size, size)
     pix.fill(Qt.GlobalColor.transparent)
@@ -172,8 +547,6 @@ def make_dot_pixmap(color: str, size: int = 10) -> QPixmap:
 # ───────────────────────── Тумблер-переключатель ─────────────────────────
 
 class ToggleSwitch(QAbstractButton):
-    """Современный анимированный переключатель (вместо стандартного чекбокса)."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
@@ -258,19 +631,21 @@ class Pinger(QObject):
             self.status_changed.emit(ok)
 
 
-# ───────────────────────── Менеджер сервера ─────────────────────────
+# ───────────────────────── Внешний сервер (опционально) ─────────────────────────
 
-class ServerManager(QObject):
+class ExternalServerProcess(QObject):
+    """Запускает указанный пользователем файл (server.py или server.exe)
+    отдельным процессом. Используется только в "экстренном" режиме —
+    когда включён соответствующий переключатель и указан путь. По
+    умолчанию не используется: сервер уже встроен в программу."""
+
     log_line = Signal(str)
-    state_changed = Signal(bool)  # True = запущен
+    state_changed = Signal(bool)
 
-    def __init__(self, script_path: Path, work_dir: Path, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.script_path = script_path
-        self.work_dir = work_dir
-        self._stopping = False  # True, пока идёт наша собственная остановка
+        self._stopping = False
         self.process = QProcess(self)
-        self.process.setWorkingDirectory(str(work_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
@@ -279,55 +654,37 @@ class ServerManager(QObject):
     def is_running(self) -> bool:
         return self.process.state() != QProcess.ProcessState.NotRunning
 
-    def _resolve_target(self):
-        """Что запускать: если рядом лежит собранный server.exe (релизная
-        сборка) — используем его напрямую. Иначе запускаем server.py текущим
-        интерпретатором Python (режим разработки / запуск из исходников)."""
-        exe_path = self.work_dir / "server.exe"
-        if exe_path.exists():
-            return str(exe_path), []
-        if self.script_path.exists():
-            return self._find_python(), [str(self.script_path)]
-        return None, None
-
-    def start(self):
+    def start(self, path: str):
         if self.is_running():
             return
-        self._stopping = False
-        program, args = self._resolve_target()
-        if not program:
-            self.log_line.emit(
-                f"[Ошибка] Не найден ни server.exe, ни {self.script_path.name} в {self.work_dir}"
-            )
+        p = Path(path)
+        if not p.exists():
+            self.log_line.emit(f"[Ошибка] Внешний сервер не найден: {path}")
+            self.state_changed.emit(False)
             return
-        self.log_line.emit(f"▶ Запуск сервера: {program} {' '.join(args)}".strip())
-        self.process.setProgram(program)
-        self.process.setArguments(args)
+
+        self._stopping = False
+        self.process.setWorkingDirectory(str(p.parent))
+        if p.suffix.lower() == ".py":
+            self.log_line.emit(f"▶ Запуск внешнего сервера: {sys.executable} {p}")
+            self.process.setProgram(sys.executable)
+            self.process.setArguments([str(p)])
+        else:
+            self.log_line.emit(f"▶ Запуск внешнего сервера: {p}")
+            self.process.setProgram(str(p))
+            self.process.setArguments([])
         self.process.start()
         self.state_changed.emit(True)
 
     def stop(self):
         if self.is_running():
-            self.log_line.emit("■ Остановка сервера…")
+            self.log_line.emit("■ Остановка внешнего сервера…")
             self._stopping = True
-            # На Windows у процесса без окна/консоли terminate() обычно
-            # ничего не может сделать (некому послать WM_CLOSE/Ctrl+Break),
-            # поэтому почти сразу переходим к принудительному завершению —
-            # это ожидаемо и не является реальной ошибкой процесса.
             self.process.terminate()
             if not self.process.waitForFinished(800):
                 self.process.kill()
                 self.process.waitForFinished(2000)
         self.state_changed.emit(False)
-
-    def _find_python(self) -> str:
-        if getattr(sys, "frozen", False):
-            for cand in ("pythonw", "python"):
-                p = shutil.which(cand)
-                if p:
-                    return p
-            return "python"
-        return sys.executable
 
     def _on_output(self):
         data = bytes(self.process.readAllStandardOutput()).decode(errors="replace")
@@ -337,20 +694,76 @@ class ServerManager(QObject):
 
     def _on_finished(self, code, status):
         if self._stopping:
-            # Это результат нашей же остановки — не пугаем пользователя кодом.
-            self.log_line.emit("⏹ Сервер остановлен")
+            self.log_line.emit("⏹ Внешний сервер остановлен")
         else:
-            self.log_line.emit(f"⏹ Сервер остановлен (код {code})")
+            self.log_line.emit(f"⏹ Внешний сервер остановлен (код {code})")
         self._stopping = False
         self.state_changed.emit(False)
 
     def _on_error(self, error):
-        # Когда мы сами останавливаем процесс через kill(), Qt всегда
-        # репортит это как ProcessError.Crashed — это ожидаемое поведение
-        # принудительного завершения, а не реальная ошибка сервера.
         if self._stopping and error == QProcess.ProcessError.Crashed:
             return
         self.log_line.emit(f"[Ошибка процесса] {error}")
+
+
+# ───────────────────────── Менеджер сервера (единая точка входа) ─────────────────────────
+
+class ServerManager(QObject):
+    """Решает, что использовать: встроенный сервер (по умолчанию) или
+    внешний файл, указанный пользователем в настройках."""
+
+    log_line = Signal(str)
+    state_changed = Signal(bool)
+
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.embedded = EmbeddedServer()
+        self.external = ExternalServerProcess(self)
+        self.external.log_line.connect(self.log_line)
+        self.external.state_changed.connect(self.state_changed)
+
+    def _use_external(self) -> bool:
+        return bool(self.settings.value("use_external_server", False, type=bool))
+
+    def is_running(self) -> bool:
+        if self._use_external():
+            return self.external.is_running()
+        return self.embedded.is_running()
+
+    def start(self):
+        if self._use_external():
+            path = self.settings.value("external_server_path", "", type=str)
+            if not path:
+                self.log_line.emit(
+                    "[Внимание] Включён внешний сервер, но путь не задан — "
+                    "запускаю встроенный."
+                )
+                self._start_embedded()
+                return
+            self.external.start(path)
+        else:
+            self._start_embedded()
+
+    def _start_embedded(self):
+        if self.embedded.is_running():
+            return
+        try:
+            self.embedded.start(self.log_line.emit)
+            self.log_line.emit(f"▶ Встроенный сервер запущен на http://{SERVER_HOST}:{SERVER_PORT}")
+            self.state_changed.emit(True)
+        except OSError as e:
+            self.log_line.emit(f"[Ошибка] Не удалось запустить сервер: {e}")
+            self.state_changed.emit(False)
+
+    def stop(self):
+        if self.external.is_running():
+            self.external.stop()
+        if self.embedded.is_running():
+            self.log_line.emit("■ Остановка сервера…")
+            self.embedded.stop()
+            self.log_line.emit("⏹ Сервер остановлен")
+            self.state_changed.emit(False)
 
 
 # ───────────────────────── Стили ─────────────────────────
@@ -384,6 +797,11 @@ QLabel#settingLabel {{
 QLabel#settingHint {{
     color: {TEXT_DIM};
     font-size: 11px;
+}}
+QLabel#pathValue {{
+    color: {TEXT_DIM};
+    font-size: 11px;
+    font-family: "Consolas", "Courier New", monospace;
 }}
 QFrame#card {{
     background: {CARD};
@@ -431,6 +849,16 @@ QPushButton#ghost {{
     padding: 4px 0;
 }}
 QPushButton#ghost:hover {{ color: {TEXT}; }}
+QPushButton#miniBtn {{
+    background: #2a2a2a;
+    color: {TEXT};
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    font-weight: 600;
+}}
+QPushButton#miniBtn:hover {{ background: #333333; }}
 QPushButton#saveBtn {{
     background: #2a2a2a;
     color: {TEXT_DIM};
@@ -480,8 +908,8 @@ class MainWindow(QMainWindow):
         self.app_icon = app_icon
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon)
-        self.resize(420, 620)
-        self.setMinimumSize(380, 520)
+        self.resize(420, 680)
+        self.setMinimumSize(380, 560)
         self.setStyleSheet(STYLESHEET)
 
         self._notified_tray_once = False
@@ -489,7 +917,7 @@ class MainWindow(QMainWindow):
 
         self.settings = QSettings("YTDownloader", "Launcher")
 
-        self.server = ServerManager(SERVER_SCRIPT, SERVER_DIR, self)
+        self.server = ServerManager(self.settings, self)
         self.server.log_line.connect(self._append_log)
         self.server.state_changed.connect(self._on_server_state)
 
@@ -601,9 +1029,7 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.toggle_server_on_launch, 0, Qt.AlignmentFlag.AlignTop)
         scl.addLayout(row1)
 
-        divider = QFrame()
-        divider.setObjectName("hline")
-        scl.addWidget(divider)
+        scl.addWidget(self._divider())
 
         # Row 2: автозапуск с Windows
         row2 = QHBoxLayout()
@@ -625,6 +1051,46 @@ class MainWindow(QMainWindow):
         row2.addLayout(row2_text, 1)
         row2.addWidget(self.toggle_windows_autostart, 0, Qt.AlignmentFlag.AlignTop)
         scl.addLayout(row2)
+
+        scl.addWidget(self._divider())
+
+        # Row 3: внешний сервер (экстренный режим)
+        row3 = QHBoxLayout()
+        row3_text = QVBoxLayout()
+        row3_text.setSpacing(1)
+        l3 = QLabel("Внешний сервер (опционально)")
+        l3.setObjectName("settingLabel")
+        l3.setWordWrap(True)
+        h3 = QLabel(
+            "Сервер уже встроен в программу — включай, только если хочешь "
+            "запускать свой server.py / server.exe вручную."
+        )
+        h3.setObjectName("settingHint")
+        h3.setWordWrap(True)
+        row3_text.addWidget(l3)
+        row3_text.addWidget(h3)
+        self.toggle_external_server = ToggleSwitch()
+        self.toggle_external_server.toggled.connect(self._on_external_toggled)
+        self.toggle_external_server.toggled.connect(self._mark_dirty)
+        row3.addLayout(row3_text, 1)
+        row3.addWidget(self.toggle_external_server, 0, Qt.AlignmentFlag.AlignTop)
+        scl.addLayout(row3)
+
+        self.external_path_row = QWidget()
+        ext_row_l = QHBoxLayout(self.external_path_row)
+        ext_row_l.setContentsMargins(0, 4, 0, 0)
+        ext_row_l.setSpacing(8)
+        self.external_path_label = QLabel("Файл не выбран")
+        self.external_path_label.setObjectName("pathValue")
+        self.external_path_label.setWordWrap(True)
+        choose_btn = QPushButton("Выбрать…")
+        choose_btn.setObjectName("miniBtn")
+        choose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        choose_btn.clicked.connect(self._choose_external_path)
+        ext_row_l.addWidget(self.external_path_label, 1)
+        ext_row_l.addWidget(choose_btn, 0)
+        self.external_path_row.setVisible(False)
+        scl.addWidget(self.external_path_row)
 
         save_row = QHBoxLayout()
         save_row.addStretch(1)
@@ -661,6 +1127,11 @@ class MainWindow(QMainWindow):
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         outer.addWidget(hint)
 
+    def _divider(self) -> QFrame:
+        divider = QFrame()
+        divider.setObjectName("hline")
+        return divider
+
     def _build_tray(self):
         self.tray = QSystemTrayIcon(self.app_icon, self)
         self.tray.setToolTip(APP_NAME)
@@ -692,6 +1163,8 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         server_on_launch = self.settings.value("start_server_on_launch", True, type=bool)
         windows_autostart = is_autostart_enabled()
+        use_external = self.settings.value("use_external_server", False, type=bool)
+        external_path = self.settings.value("external_server_path", "", type=str)
 
         self.toggle_server_on_launch.blockSignals(True)
         self.toggle_server_on_launch.setChecked(server_on_launch)
@@ -701,16 +1174,45 @@ class MainWindow(QMainWindow):
         self.toggle_windows_autostart.setChecked(windows_autostart)
         self.toggle_windows_autostart.blockSignals(False)
 
-        self._saved_state = (server_on_launch, windows_autostart)
+        self.toggle_external_server.blockSignals(True)
+        self.toggle_external_server.setChecked(use_external)
+        self.toggle_external_server.blockSignals(False)
+        self.external_path_row.setVisible(use_external)
+
+        self._external_path = external_path
+        self._update_path_label()
+
+        self._saved_state = (server_on_launch, windows_autostart, use_external, external_path)
         self._update_save_btn()
 
     def _mark_dirty(self, *_):
         self._update_save_btn()
 
+    def _on_external_toggled(self, checked: bool):
+        self.external_path_row.setVisible(checked)
+
+    def _choose_external_path(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать внешний сервер", "",
+            "Сервер (*.py *.exe);;Все файлы (*)",
+        )
+        if path:
+            self._external_path = path
+            self._update_path_label()
+            self._mark_dirty()
+
+    def _update_path_label(self):
+        if self._external_path:
+            self.external_path_label.setText(self._external_path)
+        else:
+            self.external_path_label.setText("Файл не выбран")
+
     def _current_state(self):
         return (
             self.toggle_server_on_launch.isChecked(),
             self.toggle_windows_autostart.isChecked(),
+            self.toggle_external_server.isChecked(),
+            self._external_path,
         )
 
     def _update_save_btn(self):
@@ -721,10 +1223,12 @@ class MainWindow(QMainWindow):
         self.save_btn.style().polish(self.save_btn)
 
     def _save_settings(self):
-        server_on_launch, windows_autostart = self._current_state()
+        server_on_launch, windows_autostart, use_external, external_path = self._current_state()
         self.settings.setValue("start_server_on_launch", server_on_launch)
+        self.settings.setValue("use_external_server", use_external)
+        self.settings.setValue("external_server_path", external_path)
         set_autostart(windows_autostart)
-        self._saved_state = (server_on_launch, windows_autostart)
+        self._saved_state = (server_on_launch, windows_autostart, use_external, external_path)
         self._update_save_btn()
 
         self.save_btn.setText("Сохранено ✓")
