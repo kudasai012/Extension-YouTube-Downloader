@@ -102,20 +102,40 @@ function onDocClick(e) {
   }
 }
 
-async function openMenu(anchor) {
-  closeMenu();
+// Кэш качеств по URL видео, чтобы при повторном открытии меню
+// не делать запрос к серверу заново ("Загрузка..." каждый раз).
+const formatsCache = new Map();
 
+async function getFormatsCached(url) {
+  if (formatsCache.has(url)) return formatsCache.get(url);
+  const data = await fetchFormats(url);
+  formatsCache.set(url, data);
+  return data;
+}
+
+async function openMenu(anchor) {
+  // Повторное нажатие на кнопку — закрыть уже открытое меню (toggle),
+  // а не перезапрашивать качества.
+  if (document.getElementById("ytdl-menu")) {
+    closeMenu();
+    return;
+  }
+
+  const url = currentVideoUrl();
   const menu = el("div", { id: "ytdl-menu", className: "ytdl-menu" });
   const rect = anchor.getBoundingClientRect();
   menu.style.cssText = `top:${rect.bottom + window.scrollY + 8}px;left:${rect.left + window.scrollX}px;`;
 
-  menu.append(el("div", { className: "ytdl-menu-title", textContent: "Загрузка..." }));
+  // Если качества уже в кэше — не показываем "Загрузка...".
+  if (!formatsCache.has(url)) {
+    menu.append(el("div", { className: "ytdl-menu-title", textContent: "Загрузка..." }));
+  }
   document.body.append(menu);
   setTimeout(() => document.addEventListener("click", onDocClick, true), 0);
 
   let data;
   try {
-    data = await fetchFormats(currentVideoUrl());
+    data = await getFormatsCached(url);
   } catch (e) {
     menu.innerHTML = "";
     menu.append(el("div", { className: "ytdl-menu-title", textContent: "Ошибка" }));
@@ -140,11 +160,55 @@ async function openMenu(anchor) {
     row.addEventListener("click", () => runDownload(menu, q.height, q.label));
     menu.append(row);
   }
+}
 
-  menu.append(el("div", {
-    className: "ytdl-foot",
-    textContent: "Скачивается в папку Downloads/YouTube",
-  }));
+// Прямое скачивание через ссылку — резервный путь, если связь с расширением
+// потеряна (после перезагрузки расширения старый content.js теряет chrome.runtime).
+function fallbackBrowserDownload(jobId, stat) {
+  try {
+    const a = document.createElement("a");
+    a.href = `${SERVER}/file?job_id=${encodeURIComponent(jobId)}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    stat.textContent = "✅ Готово";
+  } catch (e) {
+    stat.textContent = "❌ Не удалось начать загрузку: " + (e?.message || e);
+  }
+}
+
+// Отправляет готовый файл в загрузки браузера.
+// Сначала пробует через background (downloads API), при потере контекста —
+// падает на прямую ссылку, чтобы загрузка всё равно началась.
+function sendToBrowserDownloads(jobId, stat) {
+  const runtimeOk =
+    typeof chrome !== "undefined" &&
+    chrome.runtime &&
+    typeof chrome.runtime.sendMessage === "function" &&
+    chrome.runtime.id; // id пропадает, когда контекст расширения инвалидирован
+
+  if (!runtimeOk) {
+    fallbackBrowserDownload(jobId, stat);
+    return;
+  }
+
+  try {
+    chrome.runtime.sendMessage({ type: "browser_download", job_id: jobId }, (reply) => {
+      if (chrome.runtime.lastError) {
+        // Контекст умер во время вызова — используем резервный способ.
+        fallbackBrowserDownload(jobId, stat);
+        return;
+      }
+      if (!reply || !reply.ok) {
+        fallbackBrowserDownload(jobId, stat);
+        return;
+      }
+      stat.textContent = "✅ Готово";
+    });
+  } catch (e) {
+    fallbackBrowserDownload(jobId, stat);
+  }
 }
 
 async function runDownload(menu, height, label) {
@@ -182,36 +246,9 @@ async function runDownload(menu, height, label) {
   if (res.status === "done") {
     bar.style.width = "100%";
     bar.classList.add("ytdl-bar-ok");
-    stat.textContent = "✅ Готово: " + (res.filename || "");
+    stat.textContent = "✅ Подготовлено. Отправляю в загрузки браузера...";
 
-    // Кнопка «открыть папку» на ПК (на всякий случай)
-    const actions = el("div", { className: "ytdl-actions" });
-    const openF = el("button", {
-      className: "ytdl-act-btn",
-      textContent: "📂 Открыть папку",
-    });
-    let openBusy = false;
-    openF.addEventListener("click", () => {
-      // защита от двойных кликов: пока запрос в пути — игнорируем повторные
-      if (openBusy) return;
-      openBusy = true;
-      openF.disabled = true;
-      fetch(`${SERVER}/open_folder`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
-      })
-        .catch(() => {})
-        .finally(() => {
-          // короткая пауза, чтобы быстрые повторные клики не плодили окна
-          setTimeout(() => {
-            openBusy = false;
-            openF.disabled = false;
-          }, 700);
-        });
-    });
-    actions.append(openF);
-    menu.append(actions);
+    sendToBrowserDownloads(jobId, stat);
   } else {
     stat.textContent = "❌ Ошибка: " + (res.error || "неизвестно");
   }
@@ -316,7 +353,11 @@ function findShortsLikeButton() {
   ];
   const found = [];
   for (const s of sels) document.querySelectorAll(s).forEach((n) => found.push(n));
-  const vis = found.filter(isElementVisible);
+  const vis = found.filter((n) => {
+    if (!isElementVisible(n)) return false;
+    const r = n.getBoundingClientRect();
+    return r.left > window.innerWidth * 0.72; // только правая action-колонка Shorts
+  });
   if (!vis.length) return null;
   vis.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
   return vis[0];
@@ -327,22 +368,22 @@ function findShortsLikeButton() {
 function findShortsActionCell(likeBtn) {
   let node = likeBtn;
   let parent = node.parentElement;
-  // ищем родителя-контейнер, где лежат несколько вертикальных ячеек действий
-  for (let i = 0; i < 8 && parent; i++) {
-    const siblings = parent.children;
-    // панель действий: несколько детей, расположенных вертикально (столбиком)
+  for (let i = 0; i < 10 && parent; i++) {
+    const siblings = Array.from(parent.children);
     if (siblings.length >= 2) {
       const a = node.getBoundingClientRect();
       let verticalSiblings = 0;
+      let allOnRightSide = a.left > window.innerWidth * 0.72;
       for (const sib of siblings) {
         if (sib === node) continue;
         const b = sib.getBoundingClientRect();
-        // другой элемент примерно по той же вертикали (столбик действий)
-        if (b.width && Math.abs((b.left + b.width / 2) - (a.left + a.width / 2)) < 40) {
+        if (!b.width || !b.height) continue;
+        if (Math.abs((b.left + b.width / 2) - (a.left + a.width / 2)) < 40) {
           verticalSiblings++;
+          if (b.left <= window.innerWidth * 0.72) allOnRightSide = false;
         }
       }
-      if (verticalSiblings >= 1) {
+      if (verticalSiblings >= 1 && allOnRightSide) {
         return { cell: node, panel: parent };
       }
     }
@@ -352,49 +393,118 @@ function findShortsActionCell(likeBtn) {
   return { cell: likeBtn, panel: likeBtn.parentElement };
 }
 
-function insertShortsButton() {
-  const likeBtn = findShortsLikeButton();
-  if (!likeBtn) return false;
-
-  const { cell, panel } = findShortsActionCell(likeBtn);
-  if (!panel) return false;
+function insertShortsButtonOverlay() {
+  const host = document.body;
+  if (!host) return false;
 
   const btn = buildShortsButton();
-  panel.insertBefore(btn, cell); // НАД лайком
+  btn.classList.add('ytdl-shorts-fixed');
+  host.appendChild(btn);
   return true;
+}
+
+function findRealShortsLikeButton() {
+  const direct = document.querySelector(
+    'yt-reel-player-overlay-view-model reel-action-bar-view-model like-button-view-model button[aria-label*="Нравится"], ' +
+    'yt-reel-player-overlay-view-model reel-action-bar-view-model like-button-view-model button[aria-label*="like" i]'
+  );
+  if (direct && isElementVisible(direct)) return direct;
+
+  const fallback = document.querySelector(
+    'yt-reel-player-overlay-view-model reel-action-bar-view-model like-button-view-model button'
+  );
+  if (fallback && isElementVisible(fallback)) return fallback;
+
+  return null;
+}
+
+function positionShortsButtonNearLike() {
+  const btn = document.getElementById(SHORTS_BTN_ID);
+  const like = findRealShortsLikeButton();
+  if (!btn) return;
+
+  if (!like) {
+    btn.style.left = 'auto';
+    btn.style.right = '18px';
+    btn.style.top = '180px';
+    return;
+  }
+
+  const r = like.getBoundingClientRect();
+  btn.style.left = `${Math.round(r.left + r.width / 2 - 28)}px`;
+  btn.style.top = `${Math.round(r.top - 74)}px`;
+  btn.style.right = 'auto';
+}
+
+let shortsFollowRAF = 0;
+let shortsLastX = null;
+let shortsLastY = null;
+function startShortsFollow() {
+  if (shortsFollowRAF) return;
+  const tick = () => {
+    if (!isShorts()) {
+      shortsFollowRAF = 0;
+      return;
+    }
+    try {
+      const btn = document.getElementById(SHORTS_BTN_ID);
+      const like = findRealShortsLikeButton();
+      if (btn && like) {
+        const r = like.getBoundingClientRect();
+        const x = Math.round(r.left + r.width / 2 - 28);
+        const y = Math.round(r.top - 74);
+        if (x !== shortsLastX || y !== shortsLastY) {
+          btn.style.left = `${x}px`;
+          btn.style.top = `${y}px`;
+          btn.style.right = 'auto';
+          shortsLastX = x;
+          shortsLastY = y;
+        }
+      } else if (btn) {
+        if (shortsLastX !== -1 || shortsLastY !== 180) {
+          btn.style.left = 'auto';
+          btn.style.right = '18px';
+          btn.style.top = '180px';
+          shortsLastX = -1;
+          shortsLastY = 180;
+        }
+      }
+    } catch (_) {}
+    shortsFollowRAF = requestAnimationFrame(tick);
+  };
+  shortsFollowRAF = requestAnimationFrame(tick);
+}
+
+function stopShortsFollow() {
+  if (shortsFollowRAF) {
+    cancelAnimationFrame(shortsFollowRAF);
+    shortsFollowRAF = 0;
+  }
+  shortsLastX = null;
+  shortsLastY = null;
 }
 
 function insertButton() {
   if (isShorts()) {
-    // Если открыты комментарии/лист шеринга/другой оверлей справа,
-    // не даём кнопке перескакивать в панель комментариев.
-    const commentsOpen = document.querySelector('ytd-shorts[is-comments-panel-open], ytd-engagement-panel-section-list-renderer, tp-yt-paper-dialog ytd-comments');
-    if (commentsOpen) return;
-
-    const like = findShortsLikeButton();
-    if (!like) return;
     document.getElementById(WATCH_BTN_ID)?.remove();
 
-    const existing = document.getElementById(SHORTS_BTN_ID);
-    if (existing) {
-      const er = existing.getBoundingClientRect();
-      const lr = like.getBoundingClientRect();
-      const sameColumn =
-        er.width > 0 &&
-        Math.abs((er.left + er.width / 2) - (lr.left + lr.width / 2)) < 60 &&
-        er.bottom > 0 &&
-        er.top < window.innerHeight;
-      const isAboveLike = er.bottom <= lr.top + 8;
-      const enoughRight = er.left > window.innerWidth * 0.72; // не уезжать в колонку комментариев
-      if (sameColumn && isAboveLike && enoughRight) return;
-      existing.remove();
+    let existing = document.getElementById(SHORTS_BTN_ID);
+    if (!existing) {
+      insertShortsButtonOverlay();
+      existing = document.getElementById(SHORTS_BTN_ID);
     }
-    insertShortsButton();
+
+    if (existing) {
+      positionShortsButtonNearLike();
+      startShortsFollow();
+    }
   } else if (location.pathname.startsWith("/watch")) {
+    stopShortsFollow();
     document.getElementById(SHORTS_BTN_ID)?.remove();
     if (document.getElementById(WATCH_BTN_ID)) return;
     insertWatchButton();
   } else {
+    stopShortsFollow();
     document.getElementById(WATCH_BTN_ID)?.remove();
     document.getElementById(SHORTS_BTN_ID)?.remove();
   }

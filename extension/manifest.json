@@ -3,7 +3,7 @@
   "name": "YT Downloader — кнопка скачивания",
   "version": "1.0.0",
   "description": "Добавляет кнопку скачивания на YouTube. Качество выбирает пользователь, скачивает локальный сервер (yt-dlp).",
-  "permissions": ["storage"],
+  "permissions": ["storage", "downloads"],
   "host_permissions": [
     "http://127.0.0.1:5001/*",
     "https://www.youtube.com/*"

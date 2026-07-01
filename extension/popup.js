@@ -1,16 +1,24 @@
 const dot = document.getElementById("dot");
 const statusText = document.getElementById("status-text");
-const saveDir = document.getElementById("save-dir");
+const serverHint = document.getElementById("server-hint");
+const retryBtn = document.getElementById("retry");
 
-chrome.runtime.sendMessage({ type: "ping" }, (res) => {
-  if (res && res.ok) {
-    dot.classList.add("on");
-    statusText.textContent = "Сервер запущен ✓";
-    if (res.data && res.data.save_dir) {
-      saveDir.textContent = "Папка: " + res.data.save_dir;
+function check() {
+  dot.className = "dot";
+  statusText.textContent = "Проверка сервера…";
+
+  chrome.runtime.sendMessage({ type: "ping_server" }, (res) => {
+    if (chrome.runtime.lastError || !res || !res.ok) {
+      dot.classList.add("off");
+      statusText.textContent = "Сервер не запущен";
+      serverHint.style.display = "";
+      return;
     }
-  } else {
-    dot.classList.add("off");
-    statusText.textContent = "Сервер не запущен";
-  }
-});
+    dot.classList.add("on");
+    statusText.textContent = "Сервер запущен";
+    serverHint.style.display = "none";
+  });
+}
+
+retryBtn.addEventListener("click", check);
+check();

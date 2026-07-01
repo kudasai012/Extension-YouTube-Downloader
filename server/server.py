@@ -29,6 +29,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube")
 os.makedirs(DEFAULT_DOWNLOAD_DIR, exist_ok=True)
 
+# ----- Временная папка для подготовки файла перед браузерной загрузкой -----
+TEMP_DOWNLOAD_DIR = os.path.join(DEFAULT_DOWNLOAD_DIR, ".tmp_browser_downloads")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+
 # Прогресс активных загрузок: { job_id: {percent, speed, eta, status, filename} }
 PROGRESS = {}
 
@@ -203,7 +207,7 @@ def download():
     data = request.json or {}
     url = data.get("url")
     height = int(data.get("height", 1080))
-    save_dir = data.get("save_dir") or DEFAULT_DOWNLOAD_DIR
+    save_dir = data.get("save_dir") or TEMP_DOWNLOAD_DIR
     os.makedirs(save_dir, exist_ok=True)
 
     if not url:
@@ -286,9 +290,9 @@ def open_folder():
         if done:
             target = max(done, key=lambda p: os.path.getmtime(p))
 
-    folder = os.path.dirname(target) if target else DEFAULT_DOWNLOAD_DIR
+    folder = os.path.dirname(target) if target else TEMP_DOWNLOAD_DIR
     if not os.path.isdir(folder):
-        folder = DEFAULT_DOWNLOAD_DIR
+        folder = TEMP_DOWNLOAD_DIR
 
     print(f"[open_folder] job={job_id} target={target!r} folder={folder!r}")
 
@@ -317,15 +321,52 @@ def open_folder():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/cleanup", methods=["POST", "GET"])
+def cleanup():
+    """Удаляет временный файл задания после того, как расширение подтвердило,
+    что браузер полностью сохранил его в свои "Загрузки" (Ctrl+J).
+    Из соображений безопасности удаляем только файлы, лежащие внутри
+    TEMP_DOWNLOAD_DIR — то есть только те, что были скачаны специально для
+    последующей отправки в браузер, а не файлы из пользовательской папки
+    сохранения (save_dir), если она была указана отдельно."""
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("job_id") or request.args.get("job_id")
+    if not job_id:
+        return jsonify({"error": "no job_id"}), 400
+
+    info = PROGRESS.get(job_id)
+    if not info:
+        return jsonify({"ok": True, "skipped": "unknown job"})
+
+    path = info.get("path")
+    if not path:
+        return jsonify({"ok": True, "skipped": "no path"})
+
+    real_path = os.path.realpath(path)
+    real_tmp_dir = os.path.realpath(TEMP_DOWNLOAD_DIR)
+    if not real_path.startswith(real_tmp_dir + os.sep):
+        # Файл сохранён не во временную папку — не трогаем его.
+        return jsonify({"ok": True, "skipped": "not a temp file"})
+
+    try:
+        if os.path.exists(real_path):
+            os.remove(real_path)
+        info["path"] = None
+        info["status"] = "cleaned"
+        return jsonify({"ok": True, "deleted": real_path})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "save_dir": DEFAULT_DOWNLOAD_DIR})
+    return jsonify({"ok": True, "temp_dir": TEMP_DOWNLOAD_DIR})
 
 
 if __name__ == "__main__":
     print("=" * 50)
     print(" YouTube Downloader — локальный сервер")
     print(" Адрес:        http://127.0.0.1:5001")
-    print(" Папка загрузок:", DEFAULT_DOWNLOAD_DIR)
+    print(" Временная папка подготовки:", TEMP_DOWNLOAD_DIR)
     print("=" * 50)
     app.run(host="127.0.0.1", port=5001, threaded=True)

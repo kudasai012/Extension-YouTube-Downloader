@@ -1,60 +1,134 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8">
+  <title>YT Downloader</title>
   <style>
+    * { box-sizing: border-box; }
     body {
-      width: 280px;
+      width: 300px;
       margin: 0;
       font-family: "Roboto", Arial, sans-serif;
-      background: #1f1f1f;
-      color: #fff;
+      background: #0f0f0f;
+      color: #f1f1f1;
     }
     .head {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 14px 16px;
-      background: #ff0000;
-      font-weight: 600;
-      font-size: 15px;
+      gap: 10px;
+      padding: 16px;
+      background: linear-gradient(135deg, #ff0000, #cc0000);
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: .2px;
     }
-    .body { padding: 14px 16px; font-size: 13px; line-height: 1.5; }
+    .head svg { width: 22px; height: 22px; fill: #fff; flex: none; }
+    .body { padding: 16px; }
     .status {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 10px;
-      border-radius: 8px;
-      background: #2a2a2a;
-      margin-bottom: 12px;
+      gap: 10px;
+      padding: 11px 13px;
+      border-radius: 12px;
+      background: #1d1d1d;
+      border: 1px solid #2a2a2a;
+      font-size: 13px;
+      font-weight: 600;
     }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
-    .dot.on { background: #2ecc71; }
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #888;
+      flex: none;
+      box-shadow: 0 0 0 0 rgba(46, 204, 113, .5);
+    }
+    .dot.on  { background: #2ecc71; animation: pulse 2s infinite; }
     .dot.off { background: #e53935; }
-    .hint { opacity: 0.7; font-size: 12px; }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(46, 204, 113, .45); }
+      70%  { box-shadow: 0 0 0 7px rgba(46, 204, 113, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
+    }
+    .steps {
+      margin: 14px 0 0;
+      padding: 0;
+      list-style: none;
+      font-size: 12.5px;
+      line-height: 1.5;
+    }
+    .steps li {
+      display: flex;
+      gap: 9px;
+      padding: 7px 0;
+      border-top: 1px solid #1f1f1f;
+      color: #cfcfcf;
+    }
+    .steps li:first-child { border-top: none; }
+    .num {
+      flex: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #272727;
+      color: #ff5252;
+      font-weight: 700;
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .hint {
+      margin: 14px 0 0;
+      font-size: 12px;
+      color: #9a9a9a;
+      line-height: 1.5;
+    }
     code {
       background: #000;
-      padding: 1px 5px;
-      border-radius: 4px;
-      font-size: 12px;
+      padding: 1px 6px;
+      border-radius: 5px;
+      font-size: 11.5px;
+      color: #ffd479;
     }
+    .retry {
+      margin-top: 12px;
+      width: 100%;
+      height: 38px;
+      border: none;
+      border-radius: 10px;
+      background: #272727;
+      color: #fff;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .retry:hover { background: #333; }
   </style>
 </head>
 <body>
-  <div class="head">⬇ YT Downloader</div>
+  <div class="head">
+    <svg viewBox="0 0 24 24"><path d="M17 18v1H6v-1h11zm-.5-6.6-.7-.7-3.3 3.29V4h-1v9.99L7.2 10.7l-.7.7 4.5 4.5 4.5-4.5z"/></svg>
+    YT Downloader
+  </div>
   <div class="body">
     <div class="status">
       <span class="dot" id="dot"></span>
-      <span id="status-text">Проверка сервера...</span>
+      <span id="status-text">Проверка сервера…</span>
     </div>
-    <div id="save-dir" class="hint"></div>
-    <p class="hint">
-      Открой любое видео на YouTube — кнопка <b>«Скачать»</b> появится слева от лайка.
-    </p>
-    <p class="hint">
+
+    <ol class="steps">
+      <li><span class="num">1</span><span>Открой видео или Shorts на YouTube — кнопка <b>«Скачать»</b> появится рядом с лайком.</span></li>
+      <li><span class="num">2</span><span>Выбери качество — сервер подготовит файл.</span></li>
+      <li><span class="num">3</span><span>Видео скачается через браузер — смотри в загрузках <code>Ctrl+J</code>.</span></li>
+    </ol>
+
+    <p class="hint" id="server-hint">
       Если сервер выключен, запусти <code>start_server.bat</code> в папке <code>server</code>.
     </p>
+
+    <button class="retry" id="retry">Проверить снова</button>
   </div>
   <script src="popup.js"></script>
 </body>

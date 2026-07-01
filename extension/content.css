@@ -150,6 +150,15 @@ html[dark] .ytdl-menu { background: #282828; color: #fff; }
   padding: 0;
   box-sizing: border-box;
 }
+.ytdl-shorts-fixed {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 2147483647;
+  margin: 0;
+  transition: left 0.18s ease, top 0.18s ease, right 0.18s ease;
+  will-change: left, top;
+}
 .ytdl-shorts-circle {
   display: flex;
   align-items: center;
